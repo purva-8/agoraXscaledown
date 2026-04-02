@@ -84,7 +84,7 @@ export async function POST(req: NextRequest) {
         tts: {
           vendor: "elevenlabs",
           params: {
-            key: process.env.ELEVENLABS_API_KEY || "",
+            api_key: process.env.ELEVENLABS_API_KEY || "",
             model_id: "eleven_turbo_v2_5",
             voice_id: "21m00Tcm4TlvDq8ikWAM", // Rachel — swap as needed
           },
@@ -95,7 +95,7 @@ export async function POST(req: NextRequest) {
           vendor: "deepgram",
           language: "en-US",
           params: {
-            key: process.env.DEEPGRAM_API_KEY || "",
+            api_key: process.env.DEEPGRAM_API_KEY || "",
             model: "nova-3",
           },
         },
