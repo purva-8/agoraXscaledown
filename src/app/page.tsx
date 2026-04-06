@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useConversation } from "@/hooks/useConversation";
 
 interface TraceEvent {
@@ -21,89 +21,82 @@ interface Summary {
 
 interface TraceData {
   totalTurns: number;
-  mode: string;
   traces: TraceEvent[];
   summary: Summary;
 }
 
 interface SavedConversation {
-  id: number;
+  id: string;
   label: string;
   mode: "baseline" | "scaledown";
-  time: string;
-  traces: TraceEvent[];
-  summary: Summary;
+  createdAt: string;
+  turns: number;
+  totalTokensSaved: number;
+  avgCompressionRatio: number;
 }
 
 export default function Home() {
   const [preferredMode, setPreferredMode] = useState<"baseline" | "scaledown">("baseline");
   const [traceData, setTraceData] = useState<TraceData | null>(null);
   const [conversations, setConversations] = useState<SavedConversation[]>([]);
-  const [selectedConvId, setSelectedConvId] = useState<number | null>(null);
+  const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
+  const [selectedTraceData, setSelectedTraceData] = useState<TraceData | null>(null);
   const [isDark, setIsDark] = useState(true);
 
-  const convCounterRef = useRef(0);
-  const prevStatusRef = useRef<string>("idle");
-  const hasSavedRef = useRef(false);
-
   const {
-    status, mode, error,
+    status, mode, error, conversationId,
     audioAutoplayFailed, agentAudioReceived,
     startConversation, endConversation, unlockAudio,
   } = useConversation(preferredMode);
 
-  // Poll /api/traces every 2s while active
+  // Load all conversations from Supabase on mount
+  const refreshConversations = useCallback(async () => {
+    const res = await fetch("/api/conversations");
+    if (res.ok) {
+      const data = await res.json();
+      setConversations(data.conversations || []);
+    }
+  }, []);
+
+  useEffect(() => { refreshConversations(); }, [refreshConversations]);
+
+  // Refresh conversations list when a conversation ends
   useEffect(() => {
-    if (status !== "active") return;
+    if (status === "idle") refreshConversations();
+  }, [status, refreshConversations]);
+
+  // Poll traces every 2s while active
+  useEffect(() => {
+    if (status !== "active" || !conversationId) return;
     const poll = async () => {
-      const res = await fetch("/api/traces");
+      const res = await fetch(`/api/traces?conversationId=${conversationId}`);
       if (res.ok) setTraceData(await res.json());
     };
     poll();
     const interval = setInterval(poll, 2000);
     return () => clearInterval(interval);
-  }, [status]);
+  }, [status, conversationId]);
 
-  // Save conversation when it ends (once, on transition away from active)
+  // Load traces for a selected past conversation
   useEffect(() => {
-    const wasActive = prevStatusRef.current === "active";
-    const isNoLongerActive = status !== "active";
-    if (wasActive && isNoLongerActive && !hasSavedRef.current) {
-      hasSavedRef.current = true;
-      fetch("/api/traces").then(async (res) => {
-        if (!res.ok) return;
-        const final: TraceData = await res.json();
-        if (final.traces.length === 0) return;
-        convCounterRef.current += 1;
-        const convMode = final.traces[0]?.baselineMode ? "baseline" : "scaledown";
-        setConversations(prev => [...prev, {
-          id: convCounterRef.current,
-          label: `Conversation ${convCounterRef.current}`,
-          mode: convMode,
-          time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-          traces: final.traces,
-          summary: final.summary,
-        }]);
-        setSelectedConvId(convCounterRef.current);
-      });
-    }
-    prevStatusRef.current = status;
-  }, [status]);
+    if (!selectedConvId) { setSelectedTraceData(null); return; }
+    fetch(`/api/traces?conversationId=${selectedConvId}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => setSelectedTraceData(d));
+  }, [selectedConvId]);
 
-  // Clear traces and start a new conversation
   const handleStart = useCallback(async () => {
-    await fetch("/api/traces", { method: "DELETE" });
     setTraceData(null);
     setSelectedConvId(null);
-    hasSavedRef.current = false;
+    setSelectedTraceData(null);
     startConversation();
   }, [startConversation]);
 
-  // What to display: live data or a saved conversation
-  const selectedConv = conversations.find(c => c.id === selectedConvId);
-  const displayTraces = selectedConv ? selectedConv.traces : (traceData?.traces ?? []);
-  const displaySummary = selectedConv ? selectedConv.summary : traceData?.summary;
-  const isLive = selectedConvId === null && status === "active";
+  // What to show
+  const isLive = status === "active" && selectedConvId === null;
+  const displayData = selectedConvId ? selectedTraceData : traceData;
+  const displayTraces = displayData?.traces ?? [];
+  const displaySummary = displayData?.summary;
   const hasTraces = displayTraces.length > 0;
 
   const totalTokensSaved = displayTraces.reduce(
@@ -157,7 +150,7 @@ export default function Home() {
               className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
                 preferredMode === "baseline"
                   ? isDark ? "bg-gray-700 text-white shadow" : "bg-white text-gray-900 shadow"
-                  : `${textMuted} hover:${textSub}`
+                  : `${textMuted}`
               }`}
             >
               Baseline
@@ -168,7 +161,7 @@ export default function Home() {
               className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
                 preferredMode === "scaledown"
                   ? "bg-cyan-600 text-white shadow"
-                  : `${textMuted} hover:${textSub}`
+                  : `${textMuted}`
               }`}
             >
               ScaleDown
@@ -176,7 +169,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Status indicator */}
+        {/* Status */}
         <div className="flex items-center gap-2">
           <div className={`w-2 h-2 rounded-full shrink-0 ${
             status === "active" ? "bg-green-400 animate-pulse"
@@ -193,17 +186,11 @@ export default function Home() {
 
         {/* Action button */}
         {status === "idle" ? (
-          <button
-            onClick={handleStart}
-            className="w-full py-3.5 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded-xl font-semibold transition-colors"
-          >
+          <button onClick={handleStart} className="w-full py-3.5 bg-blue-600 hover:bg-blue-500 rounded-xl font-semibold transition-colors">
             Start Conversation
           </button>
         ) : status === "active" ? (
-          <button
-            onClick={endConversation}
-            className="w-full py-3.5 bg-red-600 hover:bg-red-500 active:bg-red-700 rounded-xl font-semibold transition-colors"
-          >
+          <button onClick={endConversation} className="w-full py-3.5 bg-red-600 hover:bg-red-500 rounded-xl font-semibold transition-colors">
             End Conversation
           </button>
         ) : (
@@ -213,24 +200,18 @@ export default function Home() {
         )}
 
         {error && (
-          <div className="p-3 bg-red-900/30 border border-red-800 rounded-lg text-red-300 text-xs">
-            {error}
-          </div>
+          <div className="p-3 bg-red-900/30 border border-red-800 rounded-lg text-red-300 text-xs">{error}</div>
         )}
 
         {audioAutoplayFailed && (
-          <button
-            onClick={unlockAudio}
-            className="w-full py-3 bg-yellow-600 hover:bg-yellow-500 rounded-xl text-sm font-medium animate-pulse"
-          >
+          <button onClick={unlockAudio} className="w-full py-3 bg-yellow-600 hover:bg-yellow-500 rounded-xl text-sm font-medium animate-pulse">
             Tap to Enable Audio
           </button>
         )}
 
         {status === "active" && (
           <p className={`text-xs ${textMuted}`}>
-            Agent audio:{" "}
-            <span className={agentAudioReceived ? "text-green-400" : "text-yellow-400"}>
+            Agent audio: <span className={agentAudioReceived ? "text-green-400" : "text-yellow-400"}>
               {agentAudioReceived ? "receiving" : "waiting..."}
             </span>
           </p>
@@ -240,28 +221,22 @@ export default function Home() {
         <div className={`mt-auto rounded-xl p-4 text-xs ${isDark ? "bg-gray-900" : "bg-gray-50 border " + border}`}>
           <p className={`font-semibold ${textMuted} mb-3 uppercase tracking-widest`}>Pipeline</p>
           <div className={`space-y-2 ${textMuted}`}>
-            <div className="flex items-center gap-2">
-              <span className={`w-1.5 h-1.5 rounded-full ${isDark ? "bg-gray-600" : "bg-gray-300"}`} />
-              <span>Voice · <span className={textSub}>Deepgram</span> (ASR)</span>
-            </div>
-            {preferredMode === "scaledown" && (
-              <div className="flex items-center gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-cyan-500" />
-                <span>Transcript · <span className="text-cyan-400 font-semibold">ScaleDown</span> (compress)</span>
+            {[
+              { label: "Voice", value: "Deepgram", note: "ASR", dot: false },
+              ...(preferredMode === "scaledown" ? [{ label: "Transcript", value: "ScaleDown", note: "compress", dot: true }] : []),
+              { label: "Context", value: "Groq llama-3.3", note: "LLM", dot: false },
+              { label: "Response", value: "Cartesia", note: "TTS", dot: false },
+              { label: "Audio via", value: "Agora RTC", note: "", dot: false },
+            ].map((item, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${item.dot ? "bg-cyan-500" : isDark ? "bg-gray-700" : "bg-gray-300"}`} />
+                <span>
+                  {item.label} ·{" "}
+                  <span className={item.dot ? "text-cyan-400 font-semibold" : textSub}>{item.value}</span>
+                  {item.note ? ` (${item.note})` : ""}
+                </span>
               </div>
-            )}
-            <div className="flex items-center gap-2">
-              <span className={`w-1.5 h-1.5 rounded-full ${isDark ? "bg-gray-600" : "bg-gray-300"}`} />
-              <span>Context · <span className={textSub}>Groq llama-3.3</span> (LLM)</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className={`w-1.5 h-1.5 rounded-full ${isDark ? "bg-gray-600" : "bg-gray-300"}`} />
-              <span>Response · <span className={textSub}>Cartesia</span> (TTS)</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className={`w-1.5 h-1.5 rounded-full ${isDark ? "bg-gray-600" : "bg-gray-300"}`} />
-              <span>Audio via <span className={textSub}>Agora RTC</span></span>
-            </div>
+            ))}
           </div>
         </div>
       </div>
@@ -270,7 +245,7 @@ export default function Home() {
       <div className="flex-1 flex flex-col p-6 gap-4 min-w-0 overflow-hidden">
 
         {/* Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between shrink-0">
           <div>
             <h2 className="text-lg font-semibold">Compression Metrics</h2>
             <p className={`${textMuted} text-sm mt-0.5`}>
@@ -290,9 +265,9 @@ export default function Home() {
         </div>
 
         {/* Conversation tabs */}
-        {conversations.length > 0 && (
+        {(conversations.length > 0 || isLive) && (
           <div className="flex gap-2 overflow-x-auto pb-0.5 shrink-0">
-            {status === "active" && (
+            {isLive && (
               <button
                 onClick={() => setSelectedConvId(null)}
                 className={`shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
@@ -317,10 +292,12 @@ export default function Home() {
                 }`}
               >
                 {conv.label}
-                <span className={`ml-1.5 ${conv.mode === "scaledown" ? "text-cyan-600" : isDark ? "text-gray-600" : "text-gray-400"}`}>
-                  {conv.mode === "scaledown" ? "ScaleDown" : "Baseline"}
+                <span className={`ml-1.5 ${conv.mode === "scaledown" ? "text-cyan-600" : textMuted}`}>
+                  · {conv.mode === "scaledown" ? "ScaleDown" : "Baseline"}
                 </span>
-                <span className={`ml-1 ${textMuted}`}>{conv.time}</span>
+                <span className={`ml-1 ${textMuted}`}>
+                  · {conv.turns} turn{conv.turns !== 1 ? "s" : ""}
+                </span>
               </button>
             ))}
           </div>
@@ -347,9 +324,7 @@ export default function Home() {
               <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
                 <p className={`${textMuted} text-xs uppercase tracking-widest`}>Avg latency</p>
                 <p className="text-3xl font-bold text-yellow-400 mt-2">
-                  {displaySummary && displaySummary.avgLatencyMs > 0
-                    ? `${displaySummary.avgLatencyMs}ms`
-                    : "0ms"}
+                  {displaySummary && displaySummary.avgLatencyMs > 0 ? `${displaySummary.avgLatencyMs}ms` : "0ms"}
                 </p>
                 <p className={`${textMuted} text-xs mt-1`}>ScaleDown overhead</p>
               </div>
@@ -360,12 +335,9 @@ export default function Home() {
               <table className="w-full text-sm">
                 <thead className={`sticky top-0 ${panelBg} border-b ${border}`}>
                   <tr>
-                    <th className={`text-left px-5 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>Turn</th>
-                    <th className={`text-right px-5 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>Original tokens</th>
-                    <th className={`text-right px-5 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>Compressed</th>
-                    <th className={`text-right px-5 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>Saved</th>
-                    <th className={`text-right px-5 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>Latency</th>
-                    <th className={`text-right px-5 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>Mode</th>
+                    {["Turn", "Original tokens", "Compressed", "Saved", "Latency", "Mode"].map((h, i) => (
+                      <th key={h} className={`${i === 0 ? "text-left" : "text-right"} px-5 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>{h}</th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
@@ -374,14 +346,11 @@ export default function Home() {
                     return (
                       <tr key={t.turn} className={`border-b ${border} last:border-0 ${isDark ? "hover:bg-gray-800/40" : "hover:bg-gray-50"} transition-colors`}>
                         <td className={`px-5 py-3.5 ${textMuted} font-mono text-xs`}>#{t.turn}</td>
-                        <td className={`px-5 py-3.5 text-right ${textSub} font-mono`}>
-                          {t.originalTokens.toLocaleString()}
-                        </td>
+                        <td className={`px-5 py-3.5 text-right ${textSub} font-mono`}>{t.originalTokens.toLocaleString()}</td>
                         <td className="px-5 py-3.5 text-right font-mono">
                           {t.baselineMode
                             ? <span className={textMuted}>—</span>
-                            : <span className="text-cyan-400">{t.compressedTokens.toLocaleString()}</span>
-                          }
+                            : <span className="text-cyan-400">{t.compressedTokens.toLocaleString()}</span>}
                         </td>
                         <td className="px-5 py-3.5 text-right">
                           {t.baselineMode ? (
@@ -416,27 +385,20 @@ export default function Home() {
             </div>
           </>
         ) : (
-          /* Empty state */
           <div className="flex-1 flex flex-col items-center justify-center text-center gap-5">
-            <div className={`w-16 h-16 rounded-2xl flex items-center justify-center text-2xl ${isDark ? "bg-gray-900" : "bg-gray-100"}`}>
-              ◎
-            </div>
+            <div className={`w-16 h-16 rounded-2xl flex items-center justify-center text-2xl ${isDark ? "bg-gray-900" : "bg-gray-100"}`}>◎</div>
             <div>
               <p className={`${textSub} font-semibold text-lg`}>No data yet</p>
               <p className={`${textMuted} text-sm mt-1.5 max-w-xs`}>
                 {preferredMode === "scaledown"
-                  ? "Start a conversation. Each turn shows original vs compressed tokens in real time."
+                  ? "Start a conversation in ScaleDown mode to see live compression metrics."
                   : "Run Baseline to capture token growth, then ScaleDown to see the savings."}
               </p>
             </div>
             <div className={`${panelBg} rounded-xl p-5 text-left text-xs max-w-sm border ${border} space-y-2`}>
               <p className={`font-semibold ${textSub} mb-1`}>How it works</p>
-              <p className={textMuted}>
-                <span className={textSub}>Baseline</span> — Agora calls Groq directly. Token history grows linearly every turn.
-              </p>
-              <p className={textMuted}>
-                <span className="text-cyan-400 font-medium">ScaleDown</span> — Conversation history is compressed before each Groq call. Same responses, fewer tokens burned.
-              </p>
+              <p className={textMuted}><span className={textSub}>Baseline</span> — Agora calls Groq directly. Token history grows linearly every turn.</p>
+              <p className={textMuted}><span className="text-cyan-400 font-medium">ScaleDown</span> — Conversation history is compressed before each Groq call. Same responses, fewer tokens burned.</p>
             </div>
           </div>
         )}
