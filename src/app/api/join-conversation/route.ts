@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAgoraAuthHeader } from "@/lib/utils";
 import { resetTurnCounter } from "@/lib/scaledown";
+import { supabase } from "@/lib/supabase";
 
 /**
  * POST /api/join-conversation
@@ -37,12 +38,27 @@ export async function POST(req: NextRequest) {
     // Reset turn counter for new conversation
     resetTurnCounter();
 
+    // Create a conversation record in Supabase to group trace events
+    const convMode = isBaseline ? "baseline" : "scaledown";
+    const convCounter = Date.now(); // used for label ordering
+    const { data: convData, error: convError } = await supabase
+      .from("conversations")
+      .insert({ label: `Conversation`, mode: convMode })
+      .select("id")
+      .single();
+
+    if (convError) {
+      console.error("[Supabase] Failed to create conversation:", convError.message);
+    }
+
+    const conversationId = convData?.id || "unknown";
+
     // Both modes route through our proxy so token counts are logged for A/B comparison.
     // Baseline uses ?baseline=true so the proxy skips ScaleDown but still records metrics.
     const proxyBase = getProxyBaseUrl(req);
     const llmUrl = isBaseline
-      ? `${proxyBase}/api/llm-proxy?baseline=true`
-      : `${proxyBase}/api/llm-proxy`;
+      ? `${proxyBase}/api/llm-proxy?baseline=true&conversationId=${conversationId}`
+      : `${proxyBase}/api/llm-proxy?conversationId=${conversationId}`;
 
     const llmApiKey = "proxy-internal"; // proxy handles Groq auth internally
 
@@ -142,6 +158,7 @@ export async function POST(req: NextRequest) {
       createTs: data.create_ts,
       status: data.status,
       mode: isBaseline ? "baseline" : "scaledown",
+      conversationId,
     });
   } catch (error) {
     console.error("Error joining conversation:", error);
