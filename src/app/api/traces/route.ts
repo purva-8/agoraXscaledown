@@ -29,19 +29,37 @@ export async function GET(req: NextRequest) {
     originalTokens: r.original_tokens,
     compressedTokens: r.compressed_tokens,
     compressionRatio: r.compression_ratio,
-    latencyMs: r.latency_ms,
+    scaledownLatencyMs: r.latency_ms,
+    groqLatencyMs: r.groq_latency_ms ?? 0,
+    totalLatencyMs: r.total_latency_ms ?? r.latency_ms,
     model: r.model,
     baselineMode: r.baseline_mode,
+    compressionSuccess: r.compression_success ?? true,
   }));
 
   const n = traces.length;
+  const scaledownTurns = traces.filter(t => !t.baselineMode);
+  const ns = scaledownTurns.length;
+
   const summary = n === 0 ? {
-    avgOriginalTokens: 0, avgCompressedTokens: 0, avgCompressionRatio: 0, avgLatencyMs: 0,
+    avgOriginalTokens: 0,
+    avgCompressedTokens: 0,
+    avgCompressionRatio: 0,
+    avgScaledownLatencyMs: 0,
+    avgGroqLatencyMs: 0,
+    avgTotalLatencyMs: 0,
+    accuracyRate: 0,
   } : {
     avgOriginalTokens: Math.round(traces.reduce((s, t) => s + t.originalTokens, 0) / n),
     avgCompressedTokens: Math.round(traces.reduce((s, t) => s + t.compressedTokens, 0) / n),
     avgCompressionRatio: Number((traces.reduce((s, t) => s + t.compressionRatio, 0) / n).toFixed(3)),
-    avgLatencyMs: Math.round(traces.reduce((s, t) => s + t.latencyMs, 0) / n),
+    avgScaledownLatencyMs: Math.round(traces.reduce((s, t) => s + t.scaledownLatencyMs, 0) / n),
+    avgGroqLatencyMs: Math.round(traces.reduce((s, t) => s + t.groqLatencyMs, 0) / n),
+    avgTotalLatencyMs: Math.round(traces.reduce((s, t) => s + t.totalLatencyMs, 0) / n),
+    // Accuracy = % of ScaleDown turns where compression succeeded (not a fallback)
+    accuracyRate: ns > 0
+      ? Number((scaledownTurns.filter(t => t.compressionSuccess).length / ns).toFixed(3))
+      : 1,
   };
 
   return NextResponse.json({ totalTurns: n, traces, summary });
