@@ -32,7 +32,7 @@ export async function compressContext(
   options?: { targetModel?: string; rate?: string }
 ): Promise<CompressResult> {
   const apiKey = process.env.SCALEDOWN_API_KEY;
-  const apiUrl = process.env.SCALEDOWN_API_URL || "https://api.scaledown.ai";
+  const apiUrl = process.env.SCALEDOWN_API_URL || "https://api.scaledown.xyz";
   const isBaseline = process.env.BASELINE_MODE === "true";
 
   const fullContext = messages.map((m) => m.content).join("\n");
@@ -67,17 +67,19 @@ export async function compressContext(
   const startTime = Date.now();
 
   try {
-    const response = await fetch(`${apiUrl}/v1/compress/raw`, {
+    const response = await fetch(`${apiUrl}/compress/raw/`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        "x-api-key": apiKey,
       },
       body: JSON.stringify({
         context: conversationMessages.map((m) => `${m.role}: ${m.content}`).join("\n"),
         prompt: conversationMessages[conversationMessages.length - 1]?.content || "",
         target_model: options?.targetModel || process.env.LLM_MODEL || "gpt-4o",
-        rate: options?.rate || "auto",
+        scaledown: {
+          rate: options?.rate || "auto",
+        },
       }),
     });
 
@@ -96,7 +98,7 @@ export async function compressContext(
     const latencyMs = Date.now() - startTime;
 
     // Reconstruct messages with compressed context
-    const compressedContent = data.compressed || data.result || data.text || "";
+    const compressedContent = data.compressed_prompt || "";
     const compressedTokens = estimateTokens(compressedContent);
     const compressionRatio = 1 - compressedTokens / originalTokens;
 
