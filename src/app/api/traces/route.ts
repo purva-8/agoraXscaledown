@@ -1,39 +1,48 @@
-import { NextResponse } from "next/server";
-import { getTraceLog, clearTraceLog } from "@/lib/tracing";
+import { NextRequest, NextResponse } from "next/server";
+import { supabase } from "@/lib/supabase";
 
 /**
- * GET /api/traces
- *
- * Returns the in-memory trace log for the current session.
- * Use this to pull benchmark data after running a conversation.
+ * GET /api/traces?conversationId=xxx
+ * Returns trace events for a specific conversation from Supabase.
  */
-export async function GET() {
-  const traces = getTraceLog();
-  return NextResponse.json({
-    totalTurns: traces.length,
-    mode: traces[0]?.baselineMode ? "baseline" : "scaledown",
-    traces,
-    summary: {
-      avgOriginalTokens: traces.length > 0
-        ? Math.round(traces.reduce((sum, t) => sum + t.originalTokens, 0) / traces.length)
-        : 0,
-      avgCompressedTokens: traces.length > 0
-        ? Math.round(traces.reduce((sum, t) => sum + t.compressedTokens, 0) / traces.length)
-        : 0,
-      avgCompressionRatio: traces.length > 0
-        ? Number((traces.reduce((sum, t) => sum + t.compressionRatio, 0) / traces.length).toFixed(3))
-        : 0,
-      avgLatencyMs: traces.length > 0
-        ? Math.round(traces.reduce((sum, t) => sum + t.latencyMs, 0) / traces.length)
-        : 0,
-    },
-  });
-}
+export async function GET(req: NextRequest) {
+  const conversationId = req.nextUrl.searchParams.get("conversationId");
 
-/**
- * DELETE /api/traces — Clear trace log before a new benchmark run
- */
-export async function DELETE() {
-  clearTraceLog();
-  return NextResponse.json({ success: true, message: "Trace log cleared" });
+  if (!conversationId) {
+    return NextResponse.json({ totalTurns: 0, traces: [], summary: {} });
+  }
+
+  const { data: rows, error } = await supabase
+    .from("trace_events")
+    .select("*")
+    .eq("conversation_id", conversationId)
+    .order("turn", { ascending: true });
+
+  if (error) {
+    console.error("[Supabase] Failed to fetch traces:", error.message);
+    return NextResponse.json({ error: "Failed to fetch traces" }, { status: 500 });
+  }
+
+  const traces = (rows || []).map((r) => ({
+    turn: r.turn,
+    timestamp: new Date(r.created_at).getTime(),
+    originalTokens: r.original_tokens,
+    compressedTokens: r.compressed_tokens,
+    compressionRatio: r.compression_ratio,
+    latencyMs: r.latency_ms,
+    model: r.model,
+    baselineMode: r.baseline_mode,
+  }));
+
+  const n = traces.length;
+  const summary = n === 0 ? {
+    avgOriginalTokens: 0, avgCompressedTokens: 0, avgCompressionRatio: 0, avgLatencyMs: 0,
+  } : {
+    avgOriginalTokens: Math.round(traces.reduce((s, t) => s + t.originalTokens, 0) / n),
+    avgCompressedTokens: Math.round(traces.reduce((s, t) => s + t.compressedTokens, 0) / n),
+    avgCompressionRatio: Number((traces.reduce((s, t) => s + t.compressionRatio, 0) / n).toFixed(3)),
+    avgLatencyMs: Math.round(traces.reduce((s, t) => s + t.latencyMs, 0) / n),
+  };
+
+  return NextResponse.json({ totalTurns: n, traces, summary });
 }
