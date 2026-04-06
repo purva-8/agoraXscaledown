@@ -29,13 +29,29 @@ let turnCounter = 0;
  */
 export async function compressContext(
   messages: Message[],
-  options?: { targetModel?: string; rate?: string }
+  options?: { targetModel?: string; rate?: string; baseline?: boolean }
 ): Promise<CompressResult> {
   const apiKey = process.env.SCALEDOWN_API_KEY;
   const apiUrl = process.env.SCALEDOWN_API_URL || "https://api.scaledown.xyz";
 
   const fullContext = messages.map((m) => m.content).join("\n");
   const originalTokens = estimateTokens(fullContext);
+
+  // Baseline mode: skip ScaleDown, just log token count for the A/B comparison
+  if (options?.baseline) {
+    turnCounter++;
+    logTrace({
+      turn: turnCounter,
+      timestamp: Date.now(),
+      originalTokens,
+      compressedTokens: originalTokens,
+      compressionRatio: 0,
+      latencyMs: 0,
+      model: process.env.LLM_MODEL || "llama-3.3-70b-versatile",
+      baselineMode: true,
+    });
+    return { messages, originalTokens, compressedTokens: originalTokens, compressionRatio: 0 };
+  }
 
   // If no API key configured, pass through without compression
   if (!apiKey) {
@@ -84,18 +100,17 @@ export async function compressContext(
     const data = await response.json();
     const latencyMs = Date.now() - startTime;
 
-    console.log("[ScaleDown] API response:", JSON.stringify({
-      successful: data.successful,
-      original_prompt_tokens: data.original_prompt_tokens,
-      compressed_prompt_tokens: data.compressed_prompt_tokens,
-      compressed_prompt_length: data.compressed_prompt?.length,
-    }));
+    // API returns fields nested under data.results
+    const results = data.results;
+    const actualOriginalTokens = data.total_original_tokens || results?.original_prompt_tokens || originalTokens;
+    const compressedContent = results?.compressed_prompt || "";
+    const compressedTokens = data.total_compressed_tokens || results?.compressed_prompt_tokens || estimateTokens(compressedContent);
+    const compressionRatio = actualOriginalTokens > 0 ? 1 - compressedTokens / actualOriginalTokens : 0;
 
-    const actualOriginalTokens = data.original_prompt_tokens || originalTokens;
+    console.log(`[ScaleDown] ${actualOriginalTokens} → ${compressedTokens} tokens (${(compressionRatio * 100).toFixed(1)}% saved)`);
 
-    // If ScaleDown didn't compress (content too short, successful=false, empty result)
-    // show 0% ratio — not 100% — and pass original messages through
-    if (!data.successful || !data.compressed_prompt) {
+    // If compression failed or returned no content, pass through original
+    if (!data.successful || !compressedContent) {
       turnCounter++;
       logTrace({
         turn: turnCounter,
@@ -114,13 +129,6 @@ export async function compressContext(
         compressionRatio: 0,
       };
     }
-
-    // Compression succeeded
-    const compressedContent = data.compressed_prompt;
-    const compressedTokens = data.compressed_prompt_tokens > 0
-      ? data.compressed_prompt_tokens
-      : estimateTokens(compressedContent);
-    const compressionRatio = actualOriginalTokens > 0 ? 1 - compressedTokens / actualOriginalTokens : 0;
 
     // Build compressed message array: system prompt + compressed history + latest user message
     const lastUserMessage = conversationMessages.filter((m) => m.role === "user").pop();
