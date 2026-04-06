@@ -25,22 +25,24 @@ interface CompressResult {
 let turnCounter = 0;
 
 /**
- * Compress conversation messages using ScaleDown's /compress endpoint
+ * Compress conversation messages using ScaleDown's /compress endpoint.
+ * conversationId is required to write trace events to Supabase.
  */
 export async function compressContext(
   messages: Message[],
-  options?: { targetModel?: string; rate?: string; baseline?: boolean }
+  options?: { targetModel?: string; rate?: string; baseline?: boolean; conversationId?: string }
 ): Promise<CompressResult> {
   const apiKey = process.env.SCALEDOWN_API_KEY;
   const apiUrl = process.env.SCALEDOWN_API_URL || "https://api.scaledown.xyz";
+  const conversationId = options?.conversationId || "unknown";
 
   const fullContext = messages.map((m) => m.content).join("\n");
   const originalTokens = estimateTokens(fullContext);
 
-  // Baseline mode: skip ScaleDown, just log token count for the A/B comparison
+  // Baseline mode: skip ScaleDown, just log token count for A/B comparison
   if (options?.baseline) {
     turnCounter++;
-    logTrace({
+    await logTrace({
       turn: turnCounter,
       timestamp: Date.now(),
       originalTokens,
@@ -49,19 +51,14 @@ export async function compressContext(
       latencyMs: 0,
       model: process.env.LLM_MODEL || "llama-3.3-70b-versatile",
       baselineMode: true,
-    });
+    }, conversationId);
     return { messages, originalTokens, compressedTokens: originalTokens, compressionRatio: 0 };
   }
 
   // If no API key configured, pass through without compression
   if (!apiKey) {
     console.warn("[ScaleDown] No API key configured, passing through uncompressed");
-    return {
-      messages,
-      originalTokens,
-      compressedTokens: originalTokens,
-      compressionRatio: 0,
-    };
+    return { messages, originalTokens, compressedTokens: originalTokens, compressionRatio: 0 };
   }
 
   // Separate system message from conversation history
@@ -80,21 +77,13 @@ export async function compressContext(
       body: JSON.stringify({
         context: conversationMessages.map((m) => `${m.role}: ${m.content}`).join("\n"),
         prompt: conversationMessages[conversationMessages.length - 1]?.content || "",
-        scaledown: {
-          rate: options?.rate || "0.5",
-        },
+        scaledown: { rate: options?.rate || "0.5" },
       }),
     });
 
     if (!response.ok) {
       console.error(`ScaleDown API error: ${response.status} ${response.statusText}`);
-      // Fall back to uncompressed on error
-      return {
-        messages,
-        originalTokens,
-        compressedTokens: originalTokens,
-        compressionRatio: 0,
-      };
+      return { messages, originalTokens, compressedTokens: originalTokens, compressionRatio: 0 };
     }
 
     const data = await response.json();
@@ -112,7 +101,7 @@ export async function compressContext(
     // If compression failed or returned no content, pass through original
     if (!data.successful || !compressedContent) {
       turnCounter++;
-      logTrace({
+      await logTrace({
         turn: turnCounter,
         timestamp: Date.now(),
         originalTokens: actualOriginalTokens,
@@ -121,16 +110,11 @@ export async function compressContext(
         latencyMs,
         model: process.env.LLM_MODEL || "llama-3.3-70b-versatile",
         baselineMode: false,
-      });
-      return {
-        messages,
-        originalTokens: actualOriginalTokens,
-        compressedTokens: actualOriginalTokens,
-        compressionRatio: 0,
-      };
+      }, conversationId);
+      return { messages, originalTokens: actualOriginalTokens, compressedTokens: actualOriginalTokens, compressionRatio: 0 };
     }
 
-    // Build compressed message array: system prompt + compressed history + latest user message
+    // Build compressed message array
     const lastUserMessage = conversationMessages.filter((m) => m.role === "user").pop();
     const compressedMessages: Message[] = [
       ...systemMessages,
@@ -141,7 +125,7 @@ export async function compressContext(
     ];
 
     turnCounter++;
-    logTrace({
+    await logTrace({
       turn: turnCounter,
       timestamp: Date.now(),
       originalTokens: actualOriginalTokens,
@@ -150,28 +134,16 @@ export async function compressContext(
       latencyMs,
       model: process.env.LLM_MODEL || "llama-3.3-70b-versatile",
       baselineMode: false,
-    });
+    }, conversationId);
 
-    return {
-      messages: compressedMessages,
-      originalTokens: actualOriginalTokens,
-      compressedTokens,
-      compressionRatio,
-    };
+    return { messages: compressedMessages, originalTokens: actualOriginalTokens, compressedTokens, compressionRatio };
+
   } catch (error) {
     console.error("ScaleDown compression failed, falling back to uncompressed:", error);
-    return {
-      messages,
-      originalTokens,
-      compressedTokens: originalTokens,
-      compressionRatio: 0,
-    };
+    return { messages, originalTokens, compressedTokens: originalTokens, compressionRatio: 0 };
   }
 }
 
-/**
- * Reset the turn counter (call at start of new conversation)
- */
 export function resetTurnCounter(): void {
   turnCounter = 0;
 }
