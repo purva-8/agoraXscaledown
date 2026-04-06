@@ -16,7 +16,7 @@ interface ConversationState {
   agentAudioReceived: boolean;
 }
 
-export function useConversation() {
+export function useConversation(preferredMode?: "baseline" | "scaledown") {
   const [state, setState] = useState<ConversationState>({
     status: "idle",
     channelName: null,
@@ -95,7 +95,7 @@ export function useConversation() {
       const joinRes = await fetch("/api/join-conversation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channelName, token: botToken, uid, botUid }),
+        body: JSON.stringify({ channelName, token: botToken, uid, botUid, requestedMode: preferredMode }),
       });
       if (!joinRes.ok) throw new Error("Failed to start AI agent");
       const { agentId, mode } = await joinRes.json();
