@@ -1,8 +1,27 @@
 import { NextResponse } from "next/server";
-import { supabase } from "@/lib/supabase";
 
 // Force dynamic — never cache this route
 export const dynamic = "force-dynamic";
+
+/**
+ * Fetch conversations directly via Supabase REST API.
+ * The JS client has an intermittent bug returning empty arrays,
+ * so we bypass it for the conversations table.
+ */
+async function fetchConversations(): Promise<any[]> {
+  const url = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/rest/v1/conversations?select=*`;
+  const res = await fetch(url, {
+    headers: {
+      apikey: process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY!}`,
+    },
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`Supabase REST error: ${res.status} ${await res.text()}`);
+  }
+  return res.json();
+}
 
 /**
  * GET /api/conversations
@@ -10,52 +29,63 @@ export const dynamic = "force-dynamic";
  */
 export async function GET() {
   try {
-    const { data: conversations, error: convError } = await supabase
-      .from("conversations")
-      .select("*");
-
-    if (convError) {
-      console.error("[conversations] Supabase error:", convError.message);
-      return NextResponse.json({ error: convError.message }, { status: 500 });
-    }
+    const conversations = await fetchConversations();
 
     if (!conversations || conversations.length === 0) {
       return NextResponse.json({ conversations: [] });
     }
 
-    // Sort by created_at in JS to avoid any Supabase ordering issues
-    conversations.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    // Sort by created_at in JS
+    conversations.sort((a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
 
     // Per-mode counters for labeling: Baseline 1, 2, 3 / ScaleDown 1, 2, 3
     let baselineCounter = 0;
     let scaledownCounter = 0;
 
-    const result = await Promise.all(conversations.map(async (conv) => {
+    const result = await Promise.all(conversations.map(async (conv: any) => {
       const modeLabel = conv.mode === "scaledown" ? "ScaleDown" : "Baseline";
       const modeIndex = conv.mode === "scaledown" ? ++scaledownCounter : ++baselineCounter;
 
-      const { data: traces } = await supabase
-        .from("trace_events")
-        .select("original_tokens, compressed_tokens, compression_ratio, latency_ms, groq_latency_ms, total_latency_ms, compression_success, baseline_mode")
-        .eq("conversation_id", conv.id);
+      const traceRes = await fetch(
+        `${process.env.NEXT_PUBLIC_SUPABASE_URL}/rest/v1/trace_events?conversation_id=eq.${encodeURIComponent(conv.id)}&select=original_tokens,compressed_tokens,compression_ratio,latency_ms,groq_latency_ms,total_latency_ms,compression_success,baseline_mode,cost_total_usd,quality_score,groq_prompt_tokens`,
+        {
+          headers: {
+            apikey: process.env.SUPABASE_SERVICE_ROLE_KEY!,
+            Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY!}`,
+          },
+          cache: "no-store",
+        }
+      );
+      const traces = traceRes.ok ? await traceRes.json() : [];
 
       const n = traces?.length || 0;
       const totalSaved = (traces || []).reduce(
-        (sum, t) => sum + Math.max(0, t.original_tokens - t.compressed_tokens), 0
+        (sum: number, t: any) => sum + Math.max(0, t.original_tokens - t.compressed_tokens), 0
       );
       const avgCompressionRatio = n > 0
-        ? (traces || []).reduce((s, t) => s + t.compression_ratio, 0) / n
+        ? (traces || []).reduce((s: number, t: any) => s + t.compression_ratio, 0) / n
         : 0;
       const avgGroqLatencyMs = n > 0
-        ? Math.round((traces || []).reduce((s, t) => s + (t.groq_latency_ms || 0), 0) / n)
+        ? Math.round((traces || []).reduce((s: number, t: any) => s + (t.groq_latency_ms || 0), 0) / n)
         : 0;
       const avgScaledownLatencyMs = n > 0
-        ? Math.round((traces || []).reduce((s, t) => s + (t.latency_ms || 0), 0) / n)
+        ? Math.round((traces || []).reduce((s: number, t: any) => s + (t.latency_ms || 0), 0) / n)
         : 0;
-      const scaledownTurns = (traces || []).filter(t => !t.baseline_mode);
+      const scaledownTurns = (traces || []).filter((t: any) => !t.baseline_mode);
       const accuracyRate = scaledownTurns.length > 0
-        ? scaledownTurns.filter(t => t.compression_success).length / scaledownTurns.length
+        ? scaledownTurns.filter((t: any) => t.compression_success).length / scaledownTurns.length
         : 1;
+
+      // Cost aggregation
+      const totalCostUsd = (traces || []).reduce(
+        (sum: number, t: any) => sum + (Number(t.cost_total_usd) || 0), 0
+      );
+
+      // Quality score aggregation
+      const scoredTraces = (traces || []).filter((t: any) => t.quality_score != null);
+      const avgQualityScore = scoredTraces.length > 0
+        ? scoredTraces.reduce((s: number, t: any) => s + Number(t.quality_score), 0) / scoredTraces.length
+        : null;
 
       return {
         id: conv.id,
@@ -68,6 +98,8 @@ export async function GET() {
         avgGroqLatencyMs,
         avgScaledownLatencyMs,
         accuracyRate: Number(accuracyRate.toFixed(3)),
+        totalCostUsd: Number(totalCostUsd.toFixed(8)),
+        avgQualityScore: avgQualityScore != null ? Number(avgQualityScore.toFixed(3)) : null,
       };
     }));
 
