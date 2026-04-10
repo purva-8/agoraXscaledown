@@ -42,6 +42,14 @@ User (microphone)
 ScaleDown sits invisibly between Agora's agent and the LLM. Agora sees it as a standard OpenAI-compatible endpoint. The compression is transparent to everything else in the pipeline.
 
 ---
+
+## Dashboard
+
+The dashboard has two tabs:
+
+- **Conversations** — dropdown to select any past conversation, shows 3 metric cards (Tokens Saved, LLM Latency, Accuracy) and a per-turn trace table. Live conversations update in real-time via polling.
+- **Eval Summary** — aggregates all conversations by mode (Baseline vs ScaleDown) with side-by-side comparison of token savings, latency, and compression metrics.
+
 ---
 
 ## Tech Stack
@@ -55,7 +63,6 @@ ScaleDown sits invisibly between Agora's agent and the LLM. Agora sees it as a s
 | Text-to-speech | [Cartesia](https://cartesia.ai) |
 | Frontend | Next.js 14 · React · Tailwind CSS |
 | Persistence | [Supabase](https://supabase.com) (PostgreSQL) |
-| Deployment | Vercel + ngrok (for Agora agent callback) |
 
 ---
 
@@ -132,8 +139,20 @@ create table trace_events (
   compressed_tokens integer,
   compression_ratio float,
   latency_ms integer,
+  groq_latency_ms integer,
+  total_latency_ms integer,
+  compression_success boolean default true,
   baseline_mode boolean default false,
   model text,
+  groq_prompt_tokens integer,
+  groq_completion_tokens integer,
+  cost_input_usd numeric(10,8),
+  cost_output_usd numeric(10,8),
+  cost_total_usd numeric(10,8),
+  token_source text default 'estimate',
+  response_text text,
+  shadow_response_text text,
+  quality_score numeric(4,3),
   created_at timestamptz default now()
 );
 ```
@@ -167,15 +186,22 @@ src/
 │   │   ├── leave-agent/          # Stops the AI agent
 │   │   ├── llm-proxy/            # ← ScaleDown integration point
 │   │   ├── conversations/        # Lists all past conversations
-│   │   └── traces/               # Returns turn-by-turn trace data
-│   └── page.tsx                  # Main dashboard UI
+│   │   ├── traces/               # Returns turn-by-turn trace data
+│   │   ├── eval/                 # Aggregates real conversation data for evaluation
+│   │   └── score-quality/        # LLM-as-judge quality scoring
+│   └── page.tsx                  # Main dashboard UI (tabs: Conversations | Eval Summary)
 ├── hooks/
 │   └── useConversation.ts        # Agora RTC + agent lifecycle
-└── lib/
-    ├── scaledown.ts              # ScaleDown compress API wrapper
-    ├── tracing.ts                # Supabase trace logging
-    ├── supabase.ts               # Supabase client
-    └── utils.ts                  # Token estimation helpers
+├── lib/
+│   ├── scaledown.ts              # ScaleDown compress API wrapper
+│   ├── tracing.ts                # Supabase trace logging (direct REST API)
+│   ├── supabase.ts               # Supabase client
+│   ├── pricing.ts                # Groq cost calculation
+│   ├── quality.ts                # LLM-as-judge quality scoring
+│   └── utils.ts                  # Token estimation helpers
+└── scripts/
+    ├── eval.ts                   # Benchmark runner (npx tsx scripts/eval.ts)
+    └── eval-scenarios.ts         # Test conversation scenarios
 ```
 
 ---
