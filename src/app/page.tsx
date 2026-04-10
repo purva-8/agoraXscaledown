@@ -44,18 +44,64 @@ interface SavedConversation {
   accuracyRate: number;
 }
 
+interface EvalConvResult {
+  id: string;
+  mode: "baseline" | "scaledown";
+  label: string;
+  turns: number;
+  totalOriginalTokens: number;
+  totalCompressedTokens: number;
+  tokensSaved: number;
+  avgCompressionRatio: number;
+  avgGroqLatencyMs: number;
+  avgScaledownLatencyMs: number;
+  avgTotalLatencyMs: number;
+}
+
+interface EvalModeAgg {
+  conversations: number;
+  totalTurns: number;
+  totalOriginalTokens: number;
+  totalCompressedTokens: number;
+  tokensSaved: number;
+  compressionPct: number;
+  avgGroqLatencyMs: number;
+  avgScaledownLatencyMs: number;
+}
+
+interface EvalData {
+  results: EvalConvResult[];
+  baseline: EvalModeAgg | null;
+  scaledown: EvalModeAgg | null;
+  comparison: {
+    tokenSavingsPct: number;
+    latencyDiffMs: number;
+    scaledownOverheadMs: number;
+  } | null;
+  summary: {
+    totalConversations: number;
+    baselineCount: number;
+    scaledownCount: number;
+    totalTurns: number;
+    totalTokensSaved: number;
+    overallCompressionPct: number;
+  };
+}
+
+type Tab = "conversation" | "eval";
+
 export default function Home() {
   const [preferredMode, setPreferredMode] = useState<"baseline" | "scaledown">("baseline");
   const [traceData, setTraceData] = useState<TraceData | null>(null);
   const [conversations, setConversations] = useState<SavedConversation[]>([]);
   const [conversationsLoading, setConversationsLoading] = useState(true);
-  const [conversationsError, setConversationsError] = useState<string | null>(null);
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
   const [selectedTraceData, setSelectedTraceData] = useState<TraceData | null>(null);
-  const [isDark, setIsDark] = useState(true);
+  const [evalData, setEvalData] = useState<EvalData | null>(null);
+  const [evalRunning, setEvalRunning] = useState(false);
+  const [evalError, setEvalError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<Tab>("conversation");
 
-  // Keep a ref to the last active conversationId so we can auto-select it after it ends
-  // (the hook clears conversationId on end, so we need to capture it before that happens)
   const lastConversationIdRef = useRef<string | null>(null);
 
   const {
@@ -64,63 +110,65 @@ export default function Home() {
     startConversation, endConversation, unlockAudio,
   } = useConversation(preferredMode);
 
-  // Load all conversations from Supabase on mount
   const refreshConversations = useCallback(async () => {
-    setConversationsError(null);
     try {
       const res = await fetch("/api/conversations");
       if (res.ok) {
         const data = await res.json();
         setConversations(data.conversations || []);
-      } else {
-        setConversationsError("Failed to load conversations");
       }
-    } catch {
-      setConversationsError("Failed to load conversations");
-    } finally {
+    } catch { /* ignore */ } finally {
       setConversationsLoading(false);
     }
   }, []);
 
   useEffect(() => { refreshConversations(); }, [refreshConversations]);
 
-  // Track conversationId in a ref so we can auto-select it after the hook clears it
   useEffect(() => {
     if (conversationId) lastConversationIdRef.current = conversationId;
   }, [conversationId]);
 
-  // When a conversation ends: refresh the list, then auto-select if it has turns
   useEffect(() => {
     if (status === "idle" && lastConversationIdRef.current) {
       const endedId = lastConversationIdRef.current;
-      refreshConversations().then(() => {
-        // Only auto-select if the conversation actually recorded turns
-        setSelectedConvId(prev => {
-          // Will be validated by the conversations list — if no turns, clear selection
-          return endedId;
-        });
-      });
+      refreshConversations().then(() => setSelectedConvId(endedId));
     }
   }, [status]);
 
   // Poll traces every 2s while active
   useEffect(() => {
+    console.log("[Poll] Effect fired: status=", status, "conversationId=", conversationId);
     if (status !== "active" || !conversationId) return;
+    console.log("[Poll] Starting polling for", conversationId);
     const poll = async () => {
-      const res = await fetch(`/api/traces?conversationId=${conversationId}`);
-      if (res.ok) setTraceData(await res.json());
+      try {
+        const res = await fetch(`/api/traces?conversationId=${conversationId}`);
+        if (res.ok) {
+          const data = await res.json();
+          console.log("[Poll] Got", data.totalTurns, "turns");
+          setTraceData(data);
+        }
+      } catch (e) {
+        console.error("[Poll] Error:", e);
+      }
     };
     poll();
     const interval = setInterval(poll, 2000);
     return () => clearInterval(interval);
   }, [status, conversationId]);
 
-  // Load traces for a selected past conversation
   useEffect(() => {
     if (!selectedConvId) { setSelectedTraceData(null); return; }
-    fetch(`/api/traces?conversationId=${selectedConvId}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => setSelectedTraceData(d));
+    const load = async () => {
+      try {
+        const res = await fetch(`/api/traces?conversationId=${selectedConvId}`);
+        if (res.ok) {
+          const d = await res.json();
+          setSelectedTraceData(d);
+        }
+      } catch { /* ignore */ }
+    };
+    load();
   }, [selectedConvId]);
 
   const handleStart = useCallback(async () => {
@@ -128,10 +176,27 @@ export default function Home() {
     setSelectedConvId(null);
     setSelectedTraceData(null);
     lastConversationIdRef.current = null;
+    setActiveTab("conversation");
     startConversation();
   }, [startConversation]);
 
-  // What to show
+  const runEval = useCallback(async () => {
+    setEvalRunning(true);
+    setEvalError(null);
+    setEvalData(null);
+    setActiveTab("eval");
+    try {
+      const res = await fetch("/api/eval", { method: "POST" });
+      if (!res.ok) throw new Error(`Eval failed: ${res.status}`);
+      setEvalData(await res.json());
+    } catch (err) {
+      setEvalError(String(err));
+    } finally {
+      setEvalRunning(false);
+    }
+  }, []);
+
+  // Display logic
   const isLive = status === "active" && selectedConvId === null;
   const displayData = selectedConvId ? selectedTraceData : traceData;
   const displayTraces = displayData?.traces ?? [];
@@ -139,82 +204,48 @@ export default function Home() {
   const hasTraces = displayTraces.length > 0;
   const selectedConvMode = selectedConvId
     ? conversations.find(c => c.id === selectedConvId)?.mode
-    : mode; // live conversation mode
+    : mode;
 
-  // Compute comparison between baseline and ScaleDown sessions
   const baselineConvs = conversations.filter(c => c.mode === "baseline" && c.turns > 0);
   const scaledownConvs = conversations.filter(c => c.mode === "scaledown" && c.turns > 0);
   const totalTokensSaved = displayTraces.reduce(
     (sum, t) => sum + Math.max(0, t.originalTokens - t.compressedTokens), 0
   );
 
-  // Theme
-  const bg = isDark ? "bg-gray-950" : "bg-slate-50";
-  const sideBg = isDark ? "bg-gray-950" : "bg-white";
-  const panelBg = isDark ? "bg-gray-900" : "bg-white";
-  const border = isDark ? "border-gray-800" : "border-gray-200";
-  const textPrimary = isDark ? "text-white" : "text-gray-900";
-  const textSub = isDark ? "text-gray-400" : "text-gray-500";
-  const textMuted = isDark ? "text-gray-600" : "text-gray-400";
-  const tabInactive = isDark
-    ? "bg-gray-800/60 text-gray-500 hover:text-gray-300"
-    : "bg-gray-100 text-gray-400 hover:text-gray-700";
+  const bg = "bg-gray-950";
+  const panelBg = "bg-gray-900";
+  const border = "border-gray-800";
+  const textSub = "text-gray-400";
+  const textMuted = "text-gray-600";
 
   return (
-    <main className={`flex flex-col h-screen ${bg} ${textPrimary} overflow-hidden transition-colors duration-200`}>
-
-      {/* Main content: left sidebar + right dashboard */}
-      <div className="flex flex-1 min-w-0 overflow-hidden">
+    <main className={`flex h-screen ${bg} text-white overflow-hidden`}>
 
       {/* ── LEFT: Controls ── */}
-      <div className={`w-80 border-r ${border} ${sideBg} flex flex-col p-6 gap-5 shrink-0`}>
-
-        {/* Branding + theme toggle */}
-        <div className="flex items-start justify-between">
-          <div>
-            <h1 className="text-xl font-bold tracking-tight">
-              Agora <span className="text-blue-400">×</span> ScaleDown
-            </h1>
-            <p className={`${textMuted} text-xs mt-0.5`}>Real-time voice AI with context compression</p>
-          </div>
-          <button
-            onClick={() => setIsDark(!isDark)}
-            className={`p-2 rounded-lg text-base transition-colors ${
-              isDark ? "bg-gray-800 text-gray-400 hover:text-white" : "bg-gray-100 text-gray-500 hover:text-gray-900"
-            }`}
-            title={isDark ? "Light mode" : "Dark mode"}
-          >
-            {isDark ? "☀" : "☾"}
-          </button>
+      <div className={`w-72 border-r ${border} ${bg} flex flex-col p-5 gap-4 shrink-0`}>
+        <div>
+          <h1 className="text-lg font-bold tracking-tight">
+            Agora <span className="text-blue-400">×</span> ScaleDown
+          </h1>
+          <p className={`${textMuted} text-xs mt-0.5`}>Voice AI + context compression</p>
         </div>
 
         {/* Mode toggle */}
-        <div>
-          <p className={`${textMuted} text-xs mb-2 uppercase tracking-widest font-medium`}>Mode</p>
-          <div className={`flex gap-1 p-1 rounded-xl ${isDark ? "bg-gray-900" : "bg-gray-100"}`}>
-            <button
-              onClick={() => setPreferredMode("baseline")}
-              disabled={status !== "idle"}
-              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
-                preferredMode === "baseline"
-                  ? isDark ? "bg-gray-700 text-white shadow" : "bg-white text-gray-900 shadow"
-                  : `${textMuted}`
-              }`}
-            >
-              Baseline
-            </button>
-            <button
-              onClick={() => setPreferredMode("scaledown")}
-              disabled={status !== "idle"}
-              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
-                preferredMode === "scaledown"
-                  ? "bg-cyan-600 text-white shadow"
-                  : `${textMuted}`
-              }`}
-            >
-              ScaleDown
-            </button>
-          </div>
+        <div className={`flex gap-1 p-1 rounded-xl bg-gray-900`}>
+          <button
+            onClick={() => setPreferredMode("baseline")}
+            disabled={status !== "idle"}
+            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-40 ${
+              preferredMode === "baseline" ? "bg-gray-700 text-white shadow" : textMuted
+            }`}
+          >Baseline</button>
+          <button
+            onClick={() => setPreferredMode("scaledown")}
+            disabled={status !== "idle"}
+            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-40 ${
+              preferredMode === "scaledown" ? "bg-cyan-600 text-white shadow" : textMuted
+            }`}
+          >ScaleDown</button>
         </div>
 
         {/* Status */}
@@ -222,41 +253,37 @@ export default function Home() {
           <div className={`w-2 h-2 rounded-full shrink-0 ${
             status === "active" ? "bg-green-400 animate-pulse"
             : status === "connecting" || status === "ending" ? "bg-yellow-400 animate-pulse"
-            : isDark ? "bg-gray-700" : "bg-gray-300"
+            : "bg-gray-700"
           }`} />
           <span className={`text-sm ${textSub}`}>
-            {status === "idle" && "Ready to start"}
+            {status === "idle" && "Ready"}
             {status === "connecting" && "Connecting..."}
             {status === "active" && `Active · ${mode === "baseline" ? "Baseline" : "ScaleDown"}`}
             {status === "ending" && "Ending..."}
           </span>
         </div>
 
-        {/* Action button */}
+        {/* Action */}
         {status === "idle" ? (
-          <button onClick={handleStart} className="w-full py-3.5 bg-blue-600 hover:bg-blue-500 rounded-xl font-semibold transition-colors">
+          <button onClick={handleStart} className="w-full py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-semibold transition-colors">
             Start Conversation
           </button>
         ) : status === "active" ? (
-          <button onClick={endConversation} className="w-full py-3.5 bg-red-600 hover:bg-red-500 rounded-xl font-semibold transition-colors">
+          <button onClick={endConversation} className="w-full py-3 bg-red-600 hover:bg-red-500 rounded-xl font-semibold transition-colors">
             End Conversation
           </button>
         ) : (
-          <button disabled className={`w-full py-3.5 rounded-xl font-semibold opacity-40 cursor-not-allowed ${isDark ? "bg-gray-700" : "bg-gray-200 text-gray-500"}`}>
+          <button disabled className="w-full py-3 rounded-xl font-semibold opacity-40 bg-gray-700">
             {status === "connecting" ? "Connecting..." : "Ending..."}
           </button>
         )}
 
-        {error && (
-          <div className="p-3 bg-red-900/30 border border-red-800 rounded-lg text-red-300 text-xs">{error}</div>
-        )}
-
+        {error && <div className="p-2 bg-red-900/30 border border-red-800 rounded-lg text-red-300 text-xs">{error}</div>}
         {audioAutoplayFailed && (
-          <button onClick={unlockAudio} className="w-full py-3 bg-yellow-600 hover:bg-yellow-500 rounded-xl text-sm font-medium animate-pulse">
+          <button onClick={unlockAudio} className="w-full py-2.5 bg-yellow-600 hover:bg-yellow-500 rounded-xl text-sm font-medium animate-pulse">
             Tap to Enable Audio
           </button>
         )}
-
         {status === "active" && (
           <p className={`text-xs ${textMuted}`}>
             Agent audio: <span className={agentAudioReceived ? "text-green-400" : "text-yellow-400"}>
@@ -266,288 +293,346 @@ export default function Home() {
         )}
 
         {/* Pipeline */}
-        <div className={`mt-auto rounded-xl p-4 text-xs ${isDark ? "bg-gray-900" : "bg-gray-50 border " + border}`}>
-          <p className={`font-semibold ${textMuted} mb-3 uppercase tracking-widest`}>Pipeline</p>
-          <div className={`space-y-2 ${textMuted}`}>
+        <div className={`mt-auto rounded-xl p-3 text-xs bg-gray-900`}>
+          <p className={`font-semibold ${textMuted} mb-2 uppercase tracking-widest text-[10px]`}>Pipeline</p>
+          <div className={`space-y-1.5 ${textMuted}`}>
             {[
-              { label: "Speech → Text", value: "Deepgram", note: "", dot: false },
-              ...(preferredMode === "scaledown" ? [{ label: "Compress context", value: "ScaleDown", note: "", dot: true }] : []),
-              { label: "AI brain", value: "Groq · Llama 3.3", note: "", dot: false },
-              { label: "Text → Speech", value: "Cartesia", note: "", dot: false },
-              { label: "Voice transport", value: "Agora RTC", note: "", dot: false },
+              { label: "ASR", value: "Deepgram", dot: false },
+              ...(preferredMode === "scaledown" ? [{ label: "Compress", value: "ScaleDown", dot: true }] : []),
+              { label: "LLM", value: "Groq · Llama 3.3", dot: false },
+              { label: "TTS", value: "Cartesia", dot: false },
+              { label: "Transport", value: "Agora RTC", dot: false },
             ].map((item, i) => (
               <div key={i} className="flex items-center gap-2">
-                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${item.dot ? "bg-cyan-500" : isDark ? "bg-gray-700" : "bg-gray-300"}`} />
-                <span>
-                  {item.label} ·{" "}
-                  <span className={item.dot ? "text-cyan-400 font-semibold" : textSub}>{item.value}</span>
-                  {item.note ? ` (${item.note})` : ""}
-                </span>
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${item.dot ? "bg-cyan-500" : "bg-gray-700"}`} />
+                <span>{item.label} · <span className={item.dot ? "text-cyan-400 font-semibold" : textSub}>{item.value}</span></span>
               </div>
             ))}
           </div>
         </div>
       </div>
 
-      {/* ── RIGHT: Metrics ── */}
-      <div className="flex-1 flex flex-col p-6 gap-4 min-w-0 overflow-hidden">
+      {/* ── RIGHT: Dashboard ── */}
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
 
-        {/* Header */}
-        <div className="flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-3">
-            {selectedConvId && conversations.some(c => c.id === selectedConvId) && (
-              <button
-                onClick={() => setSelectedConvId(null)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                  isDark
-                    ? "bg-gray-800 text-gray-300 hover:text-white border-gray-700 hover:border-gray-600"
-                    : "bg-gray-100 text-gray-600 hover:text-gray-900 border-gray-200 hover:border-gray-300"
-                }`}
-              >
-                ← Back to Live
-              </button>
-            )}
-            <div>
-              <h2 className="text-lg font-semibold">
-                {selectedConvId && conversations.find(c => c.id === selectedConvId)
-                  ? conversations.find(c => c.id === selectedConvId)!.label
-                  : "Live Savings Dashboard"}
-              </h2>
-              <p className={`${textMuted} text-sm mt-0.5`}>
-                {isLive
-                  ? `Listening · ${traceData?.traces.length ?? 0} exchange${traceData?.traces.length !== 1 ? "s" : ""} so far`
-                  : hasTraces
-                  ? `${displayTraces.length} exchanges recorded`
-                  : "Start a conversation to see savings appear in real time"}
-              </p>
-            </div>
-          </div>
-          {isLive && (
-            <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-              <span className="text-xs text-green-400 font-medium">Live</span>
-            </div>
-          )}
+        {/* Tab bar */}
+        <div className={`flex items-center border-b ${border} px-6 shrink-0`}>
+          <button
+            onClick={() => setActiveTab("conversation")}
+            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === "conversation"
+                ? "border-blue-500 text-white"
+                : "border-transparent text-gray-500 hover:text-gray-300"
+            }`}
+          >
+            Conversations
+          </button>
+          <button
+            onClick={() => { setActiveTab("eval"); if (!evalData && !evalRunning) runEval(); }}
+            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+              activeTab === "eval"
+                ? "border-purple-500 text-white"
+                : "border-transparent text-gray-500 hover:text-gray-300"
+            }`}
+          >
+            Eval Summary
+          </button>
+          <div className="ml-auto" />
         </div>
 
-        {/* Conversation selectors — two dropdowns */}
-        {(conversations.length > 0 || isLive || conversationsLoading || conversationsError) && (
-          <div className="flex gap-3 items-center shrink-0 flex-wrap">
-            {isLive && (
-              <button
-                onClick={() => setSelectedConvId(null)}
-                className={`shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                  selectedConvId === null
-                    ? "bg-green-900/40 text-green-400 border-green-800"
-                    : `${tabInactive} border-transparent`
-                }`}
-              >
-                ● Live
-              </button>
-            )}
-            {conversationsLoading && !isLive && (
-              <span className={`text-xs ${textMuted}`}>Loading conversations…</span>
-            )}
-            {conversationsError && !isLive && (
-              <span className="text-xs text-red-400">{conversationsError}</span>
-            )}
-            {/* Baseline dropdown */}
-            {baselineConvs.length > 0 && (
-              <div className="flex items-center gap-1.5">
-                <span className={`text-xs font-medium uppercase tracking-widest ${textMuted}`}>Baseline</span>
+        {/* ── Tab: Conversations ── */}
+        {activeTab === "conversation" && (
+          <div className="flex-1 flex flex-col p-6 gap-4 overflow-auto">
+
+            {/* Conversation selector */}
+            <div className="flex gap-3 items-center flex-wrap shrink-0">
+              {status === "active" && (
+                <button
+                  onClick={() => setSelectedConvId(null)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                    selectedConvId === null
+                      ? "bg-green-900/40 text-green-400 border-green-800"
+                      : "bg-gray-800/60 text-gray-500 hover:text-green-400 border-transparent"
+                  }`}
+                >● Live</button>
+              )}
+              {conversationsLoading && status !== "active" && <span className={`text-xs ${textMuted}`}>Loading...</span>}
+              {baselineConvs.length > 0 && (
                 <select
                   value={selectedConvId && baselineConvs.some(c => c.id === selectedConvId) ? selectedConvId : ""}
                   onChange={(e) => setSelectedConvId(e.target.value || null)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
-                    isDark
-                      ? "bg-gray-800 text-gray-300 border-gray-700 hover:border-gray-600"
-                      : "bg-white text-gray-700 border-gray-300 hover:border-gray-400"
-                  }`}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium border bg-gray-800 text-gray-300 border-gray-700 cursor-pointer"
                 >
-                  <option value="">Select...</option>
-                  {baselineConvs.map(conv => (
-                    <option key={conv.id} value={conv.id}>
-                      {conv.label} · {conv.turns} turn{conv.turns !== 1 ? "s" : ""}
-                    </option>
-                  ))}
+                  <option value="">Baseline...</option>
+                  {baselineConvs.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
                 </select>
-              </div>
-            )}
-            {/* ScaleDown dropdown */}
-            {scaledownConvs.length > 0 && (
-              <div className="flex items-center gap-1.5">
-                <span className="text-xs font-medium uppercase tracking-widest text-cyan-500">ScaleDown</span>
+              )}
+              {scaledownConvs.length > 0 && (
                 <select
                   value={selectedConvId && scaledownConvs.some(c => c.id === selectedConvId) ? selectedConvId : ""}
                   onChange={(e) => setSelectedConvId(e.target.value || null)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
-                    isDark
-                      ? "bg-gray-800 text-cyan-400 border-cyan-900 hover:border-cyan-700"
-                      : "bg-white text-cyan-700 border-cyan-300 hover:border-cyan-400"
-                  }`}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium border bg-gray-800 text-cyan-400 border-cyan-900 cursor-pointer"
                 >
-                  <option value="">Select...</option>
-                  {scaledownConvs.map(conv => (
-                    <option key={conv.id} value={conv.id}>
-                      {conv.label} · {conv.turns} turn{conv.turns !== 1 ? "s" : ""}
-                    </option>
-                  ))}
+                  <option value="">ScaleDown...</option>
+                  {scaledownConvs.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
                 </select>
+              )}
+              {selectedConvId && status !== "active" && (
+                <button onClick={() => setSelectedConvId(null)} className="text-xs text-gray-500 hover:text-gray-300">
+                  ← clear
+                </button>
+              )}
+            </div>
+
+            {hasTraces ? (
+              <>
+                {/* 3 key metric cards */}
+                <div className="grid grid-cols-3 gap-3 shrink-0">
+                  <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
+                    <p className={`${textMuted} text-xs uppercase tracking-widest`}>Tokens saved</p>
+                    <p className="text-3xl font-bold text-cyan-400 mt-2">{totalTokensSaved.toLocaleString()}</p>
+                    <p className={`${textMuted} text-xs mt-1`}>
+                      {selectedConvMode === "baseline" ? "no compression" : `${(displaySummary?.avgCompressionRatio ?? 0) * 100 | 0}% avg reduction`}
+                    </p>
+                  </div>
+                  <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
+                    <p className={`${textMuted} text-xs uppercase tracking-widest`}>LLM latency</p>
+                    <p className="text-3xl font-bold text-yellow-400 mt-2">
+                      {displaySummary && displaySummary.avgGroqLatencyMs > 0
+                        ? `${displaySummary.avgGroqLatencyMs}ms` : "—"}
+                    </p>
+                    <p className={`${textMuted} text-xs mt-1`}>avg Groq response time</p>
+                  </div>
+                  <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
+                    <p className={`${textMuted} text-xs uppercase tracking-widest`}>Accuracy</p>
+                    <p className="text-3xl font-bold text-green-400 mt-2">
+                      {selectedConvMode === "baseline"
+                        ? "100%"
+                        : `${((displaySummary?.accuracyRate ?? 1) * 100).toFixed(0)}%`}
+                    </p>
+                    <p className={`${textMuted} text-xs mt-1`}>
+                      {selectedConvMode === "baseline" ? "baseline (no compression)" : "compression success"}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Per-turn table */}
+                <div className={`${panelBg} rounded-xl border ${border} overflow-auto flex-1`}>
+                  <table className="w-full text-sm">
+                    <thead className={`sticky top-0 ${panelBg} border-b ${border}`}>
+                      <tr>
+                        {["Turn", "Context", "After SD", "Saved", "LLM latency", "Status"].map(h => (
+                          <th key={h} className={`text-left px-4 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {displayTraces.map((t) => {
+                        return (
+                          <tr key={`${t.turn}-${t.originalTokens}`} className={`border-b ${border} last:border-0 hover:bg-gray-800/40 transition-colors`}>
+                            <td className={`px-4 py-3 ${textMuted} text-sm`}>
+                              {t.turn}
+                              <span className={`ml-2 text-xs px-1.5 py-0.5 rounded-full ${
+                                t.baselineMode ? "bg-gray-800 text-gray-500" : "bg-cyan-950 text-cyan-400 border border-cyan-900"
+                              }`}>
+                                {t.baselineMode ? "Baseline" : "ScaleDown"}
+                              </span>
+                            </td>
+                            <td className={`px-4 py-3 ${textSub} font-mono text-sm`}>
+                              {t.originalTokens.toLocaleString()}
+                            </td>
+                            <td className="px-4 py-3 font-mono text-sm">
+                              {t.baselineMode
+                                ? <span className={textMuted}>—</span>
+                                : <span className="text-cyan-400">{t.compressedTokens.toLocaleString()}</span>}
+                            </td>
+                            <td className="px-4 py-3">
+                              {t.baselineMode ? (
+                                <span className={textMuted}>—</span>
+                              ) : (
+                                <span className={`font-semibold ${t.compressionRatio >= 0.2 ? "text-green-400" : "text-yellow-400"}`}>
+                                  {(t.compressionRatio * 100).toFixed(0)}%
+                                </span>
+                              )}
+                            </td>
+                            <td className={`px-4 py-3 font-mono text-sm ${t.groqLatencyMs > 0 ? "text-yellow-400" : textMuted}`}>
+                              {t.groqLatencyMs > 0 ? `${t.groqLatencyMs}ms` : "—"}
+                            </td>
+                            <td className="px-4 py-3 text-sm">
+                              {t.baselineMode ? (
+                                <span className={textSub}>baseline</span>
+                              ) : t.compressionSuccess ? (
+                                <span className="text-green-400">ok</span>
+                              ) : (
+                                <span className="text-orange-400">fallback</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            ) : (
+              <div className="flex-1 flex flex-col items-center justify-center text-center gap-4">
+                <p className={`${textSub} font-semibold`}>No data yet</p>
+                <p className={`${textMuted} text-sm max-w-xs`}>
+                  {preferredMode === "scaledown"
+                    ? "Start a conversation to see live token savings."
+                    : "Baseline captures raw usage — run both modes to compare."}
+                </p>
               </div>
             )}
           </div>
         )}
 
-        {hasTraces ? (
-          <>
-            {/* Per-conversation summary cards */}
-            <div className="grid grid-cols-4 gap-3 shrink-0">
-              <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
-                <p className={`${textMuted} text-xs uppercase tracking-widest`}>Tokens saved</p>
-                <p className="text-3xl font-bold tracking-tight text-cyan-400 mt-2">{totalTokensSaved.toLocaleString()}</p>
-                <p className={`${textMuted} text-xs mt-1`}>this conversation</p>
-              </div>
-              <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
-                <p className={`${textMuted} text-xs uppercase tracking-widest`}>Context reduction</p>
-                <p className="text-3xl font-bold tracking-tight text-green-400 mt-2">
-                  {displaySummary && displaySummary.avgCompressionRatio > 0
-                    ? `${(displaySummary.avgCompressionRatio * 100).toFixed(0)}%`
-                    : "0%"}
-                </p>
-                <p className={`${textMuted} text-xs mt-1`}>smaller on average</p>
-              </div>
-              <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
-                <p className={`${textMuted} text-xs uppercase tracking-widest`}>Quality retained</p>
-                <p className="text-3xl font-bold tracking-tight text-purple-400 mt-2">
-                  {selectedConvMode === "baseline"
-                    ? "100%"
-                    : displaySummary ? `${(displaySummary.accuracyRate * 100).toFixed(0)}%` : "—"}
-                </p>
-                <p className={`${textMuted} text-xs mt-1`}>
-                  {selectedConvMode === "baseline" ? "no compression applied" : "of turns fully preserved"}
-                </p>
-              </div>
-              <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
-                <p className={`${textMuted} text-xs uppercase tracking-widest`}>Avg AI reply</p>
-                <p className="text-3xl font-bold tracking-tight text-yellow-400 mt-2">
-                  {displaySummary && displaySummary.avgGroqLatencyMs > 0
-                    ? `${displaySummary.avgGroqLatencyMs}ms`
-                    : "—"}
-                </p>
-                <p className={`${textMuted} text-xs mt-1`}>response time</p>
-              </div>
-            </div>
+        {/* ── Tab: Eval ── */}
+        {activeTab === "eval" && (
+          <div className="flex-1 flex flex-col p-6 gap-4 overflow-auto">
 
-            {/* Per-turn table */}
-            <div className={`${panelBg} rounded-xl border ${border} overflow-auto flex-1`}>
-              <table className="w-full text-sm">
-                <thead className={`sticky top-0 ${panelBg} border-b ${border}`}>
-                  <tr>
-                    {[
-                      { label: "Turn", align: "left" },
-                      { label: "Context size", align: "right" },
-                      { label: "After ScaleDown", align: "right" },
-                      { label: "Tokens saved", align: "right" },
-                      { label: "AI reply time", align: "right" },
-                      { label: "Quality", align: "right" },
-                    ].map((h) => (
-                      <th key={h.label} className={`text-${h.align} px-4 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>{h.label}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {displayTraces.map((t) => {
-                    const saved = Math.max(0, t.originalTokens - t.compressedTokens);
-                    return (
-                      <tr key={t.turn} className={`border-b ${border} last:border-0 ${isDark ? "hover:bg-gray-800/40" : "hover:bg-gray-50"} transition-colors`}>
-                        <td className={`px-4 py-3.5 ${textMuted} text-sm`}>
-                          Turn {t.turn}
-                          <span className={`ml-2 text-xs px-2 py-0.5 rounded-full ${
-                            t.baselineMode
-                              ? isDark ? "bg-gray-800 text-gray-500" : "bg-gray-100 text-gray-400"
-                              : "bg-cyan-950 text-cyan-400 border border-cyan-900"
-                          }`}>
-                            {t.baselineMode ? "no compression" : "ScaleDown ✓"}
-                          </span>
-                        </td>
-                        <td className={`px-4 py-3.5 text-right ${textSub} font-mono`}>
-                          {t.originalTokens.toLocaleString()} <span className={`${textMuted} text-xs`}>tokens</span>
-                        </td>
-                        <td className="px-4 py-3.5 text-right font-mono">
-                          {t.baselineMode
-                            ? <span className={`${textMuted} text-sm`}>unchanged</span>
-                            : <span className="text-cyan-400">{t.compressedTokens.toLocaleString()} <span className={`${textMuted} text-xs`}>tokens</span></span>}
-                        </td>
-                        <td className="px-4 py-3.5 text-right">
-                          {t.baselineMode ? (
-                            <span className={`${textMuted} text-sm`}>—</span>
-                          ) : (
-                            <span className={`font-semibold ${
-                              t.compressionRatio >= 0.3 ? "text-green-400"
-                              : t.compressionRatio >= 0.1 ? "text-yellow-400"
-                              : "text-gray-400"
-                            }`}>
-                              {saved > 0 ? `−${saved.toLocaleString()}` : "0"}{" "}
-                              <span className="text-xs opacity-70">({(t.compressionRatio * 100).toFixed(0)}% less)</span>
-                            </span>
-                          )}
-                        </td>
-                        <td className={`px-4 py-3.5 text-right font-mono text-sm ${t.groqLatencyMs > 0 ? "text-yellow-400" : textMuted}`}>
-                          {t.groqLatencyMs > 0 ? `${t.groqLatencyMs}ms` : "—"}
-                        </td>
-                        <td className="px-4 py-3.5 text-right">
-                          {t.baselineMode ? (
-                            <span className={`${textSub} text-sm font-medium`}>100%</span>
-                          ) : t.compressionSuccess ? (
-                            <span className="text-green-400 text-sm font-medium">✓ Full quality</span>
-                          ) : (
-                            <span className="text-orange-400 text-sm font-medium">⚠ Used original</span>
-                          )}
-                        </td>
+            {evalRunning && (
+              <div className="flex-1 flex flex-col items-center justify-center gap-3">
+                <div className="w-8 h-8 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                <p className={`${textSub} text-sm`}>Analyzing conversations...</p>
+              </div>
+            )}
+
+            {evalError && (
+              <div className="p-3 bg-red-900/30 border border-red-800 rounded-lg text-red-300 text-xs">{evalError}</div>
+            )}
+
+            {evalData && !evalRunning && (
+              <>
+                <div className="flex items-center justify-between shrink-0">
+                  <div>
+                    <h3 className="text-base font-semibold">All Conversations — Summary</h3>
+                    <p className={`${textMuted} text-xs mt-0.5`}>
+                      {evalData.summary.totalConversations} conversations · {evalData.summary.totalTurns} total turns
+                    </p>
+                  </div>
+                  <button onClick={runEval} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-purple-900/50 text-purple-300 hover:bg-purple-800/50 border border-purple-800">
+                    Refresh
+                  </button>
+                </div>
+
+                {/* Key metrics */}
+                <div className="grid grid-cols-3 gap-3 shrink-0">
+                  <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
+                    <p className={`${textMuted} text-xs uppercase tracking-widest`}>Token savings</p>
+                    <p className="text-3xl font-bold text-cyan-400 mt-2">{evalData.summary.overallCompressionPct}%</p>
+                    <p className={`${textMuted} text-xs mt-1`}>{evalData.summary.totalTokensSaved.toLocaleString()} tokens saved</p>
+                  </div>
+                  <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
+                    <p className={`${textMuted} text-xs uppercase tracking-widest`}>LLM latency</p>
+                    <p className="text-3xl font-bold text-yellow-400 mt-2">
+                      {evalData.scaledown ? `${evalData.scaledown.avgGroqLatencyMs}ms` : "—"}
+                    </p>
+                    <p className={`${textMuted} text-xs mt-1`}>
+                      {evalData.baseline ? `baseline: ${evalData.baseline.avgGroqLatencyMs}ms` : "no baseline yet"}
+                    </p>
+                  </div>
+                  <div className={`${panelBg} rounded-xl p-4 border ${border}`}>
+                    <p className={`${textMuted} text-xs uppercase tracking-widest`}>Conversations</p>
+                    <p className="text-3xl font-bold text-blue-400 mt-2">{evalData.summary.totalConversations}</p>
+                    <p className={`${textMuted} text-xs mt-1`}>
+                      {evalData.summary.baselineCount} baseline · {evalData.summary.scaledownCount} scaledown
+                    </p>
+                  </div>
+                </div>
+
+                {/* Side-by-side comparison */}
+                {evalData.baseline && evalData.scaledown && evalData.comparison && (
+                  <div className={`rounded-xl p-4 border border-cyan-900 bg-cyan-950/30`}>
+                    <p className="text-xs font-semibold uppercase tracking-widest text-cyan-400 mb-3">
+                      Baseline vs ScaleDown
+                    </p>
+                    <div className="grid grid-cols-3 gap-4 text-sm">
+                      <div>
+                        <p className={textMuted}>Avg tokens / turn</p>
+                        <p className={textSub}>
+                          {Math.round(evalData.baseline.totalOriginalTokens / evalData.baseline.totalTurns)}
+                          <span className="text-cyan-400"> → {Math.round(evalData.scaledown.totalCompressedTokens / evalData.scaledown.totalTurns)}</span>
+                        </p>
+                      </div>
+                      <div>
+                        <p className={textMuted}>Avg LLM latency</p>
+                        <p className={textSub}>
+                          {evalData.baseline.avgGroqLatencyMs}ms
+                          <span className="text-cyan-400"> → {evalData.scaledown.avgGroqLatencyMs}ms</span>
+                        </p>
+                      </div>
+                      <div>
+                        <p className={textMuted}>ScaleDown overhead</p>
+                        <p className={textSub}>{evalData.comparison.scaledownOverheadMs}ms avg</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {!evalData.baseline && (
+                  <div className="rounded-lg p-3 border border-yellow-900 bg-yellow-950/30">
+                    <p className="text-xs text-yellow-400">Run baseline conversations to see side-by-side comparison.</p>
+                  </div>
+                )}
+
+                {/* Per-conversation table */}
+                <div className={`${panelBg} rounded-xl border ${border} overflow-auto flex-1`}>
+                  <table className="w-full text-sm">
+                    <thead className={`sticky top-0 ${panelBg} border-b ${border}`}>
+                      <tr>
+                        {["Conversation", "Mode", "Turns", "Tokens", "Saved", "Avg latency"].map(h => (
+                          <th key={h} className={`text-left px-4 py-3 ${textMuted} font-medium text-xs uppercase tracking-wide`}>{h}</th>
+                        ))}
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </>
-        ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-center gap-6">
-            <div className={`w-12 h-12 rounded-xl flex items-center justify-center border ${border} ${isDark ? "bg-gray-900" : "bg-gray-50"}`}>
-              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" className={isDark ? "text-gray-500" : "text-gray-400"}>
-                <circle cx="10" cy="10" r="9" stroke="currentColor" strokeWidth="1.5"/>
-                <path d="M10 6v4l2.5 2.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-              </svg>
-            </div>
-            <div>
-              <p className={`${textSub} font-semibold text-base`}>No data yet</p>
-              <p className={`${textMuted} text-sm mt-1.5 max-w-xs leading-relaxed`}>
-                {preferredMode === "scaledown"
-                  ? "Start a conversation to see live token savings turn by turn."
-                  : "Baseline mode captures raw token usage — run both modes to compare."}
-              </p>
-            </div>
-            <div className={`rounded-xl p-5 text-left text-sm max-w-sm border ${border} ${isDark ? "bg-gray-900/60" : "bg-gray-50"} space-y-3`}>
-              <p className={`text-xs font-semibold uppercase tracking-widest ${textMuted}`}>How it works</p>
-              <p className={`${textMuted} leading-relaxed`}>
-                <span className={`font-medium ${textSub}`}>Without ScaleDown —</span> the full conversation history is sent to the AI on every turn. Token costs grow linearly.
-              </p>
-              <p className={`${textMuted} leading-relaxed`}>
-                <span className="font-medium text-cyan-400">With ScaleDown —</span> history is compressed before each call. The AI sees the same meaning with fewer tokens. Cost stays flat.
-              </p>
-            </div>
+                    </thead>
+                    <tbody>
+                      {evalData.results.map((r) => (
+                        <tr key={r.id} className={`border-b ${border} last:border-0 hover:bg-gray-800/40 transition-colors`}>
+                          <td className="px-4 py-3 font-medium text-sm">{r.label}</td>
+                          <td className="px-4 py-3">
+                            <span className={`text-xs px-2 py-0.5 rounded-full ${
+                              r.mode === "scaledown"
+                                ? "bg-cyan-950 text-cyan-400 border border-cyan-900"
+                                : "bg-gray-800 text-gray-400"
+                            }`}>{r.mode === "scaledown" ? "ScaleDown" : "Baseline"}</span>
+                          </td>
+                          <td className={`px-4 py-3 ${textSub}`}>{r.turns}</td>
+                          <td className="px-4 py-3 font-mono text-sm">
+                            <span className={textSub}>{r.totalOriginalTokens.toLocaleString()}</span>
+                            {r.mode === "scaledown" && (
+                              <span className="text-cyan-400"> → {r.totalCompressedTokens.toLocaleString()}</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            {r.mode === "scaledown" ? (
+                              <span className={`font-semibold ${r.avgCompressionRatio > 0.2 ? "text-green-400" : "text-yellow-400"}`}>
+                                {(r.avgCompressionRatio * 100).toFixed(0)}%
+                              </span>
+                            ) : <span className={textMuted}>—</span>}
+                          </td>
+                          <td className={`px-4 py-3 font-mono text-sm text-yellow-400`}>
+                            {r.avgGroqLatencyMs}ms
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+
+            {!evalData && !evalRunning && !evalError && (
+              <div className="flex-1 flex flex-col items-center justify-center gap-3">
+                <p className={`${textSub} font-semibold`}>No eval data</p>
+                <button onClick={runEval} className="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded-lg text-sm font-medium">
+                  Analyze Conversations
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>
-      </div>
-
-      {/* Footer: Conversation counter */}
-      {(baselineConvs.length > 0 || scaledownConvs.length > 0) && (
-        <div className={`${sideBg} border-t ${border} px-6 py-3 text-xs ${textSub} flex items-center justify-between shrink-0`}>
-          <span>Total conversations: <span className="font-semibold text-white">{baselineConvs.length + scaledownConvs.length}</span></span>
-          <span>Baseline: <span className="text-gray-400">{baselineConvs.length}</span> | ScaleDown: <span className="text-cyan-400">{scaledownConvs.length}</span></span>
-        </div>
-      )}
     </main>
   );
 }
